@@ -1,21 +1,23 @@
 import base64
+import ast
 import http.client
 from http.server import ThreadingHTTPServer
-import importlib
 import io
 import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
-from api.index import handler
+from api import index as application
+from api.index import APP_VERSION, handler, StateStore, StorageBusy, StorageError
 from scripts import set_webhooks
 from scripts.migrate_data import migrate
-from tl.storage import StateStore, StorageBusy, StorageError
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = ROOT / '.runtime'
@@ -24,6 +26,7 @@ TEST_ENV = {
     'SHOP_TOKEN': '123456:TEST_SHOP', 'ADMIN_TOKEN': '654321:TEST_ADMIN',
     'ADMIN_ID': '99', 'WEBHOOK_SECRET': 'test-secret',
     'VERCEL': '', 'UPSTASH_REDIS_REST_URL': '', 'UPSTASH_REDIS_REST_TOKEN': '',
+    'KV_REST_API_URL': '', 'KV_REST_API_TOKEN': '',
     'BOT_STORAGE_KEY': 'test:state',
 }
 
@@ -83,9 +86,10 @@ class BotTests(unittest.TestCase):
     self.env = patch.dict(os.environ, {**TEST_ENV, 'BOT_DATA_DIR': self.temp.name})
     self.env.start()
     self.addCleanup(self.env.stop)
-    sys.modules.pop('tl.tl', None)
+    self.bot = application
+    self.bot._runtime_initialized = False
     with patch('telebot.apihelper._make_request', side_effect=AssertionError('Import called Telegram')):
-      self.bot = importlib.import_module('tl.tl')
+      self.bot.ensure_runtime()
     self.api = patch('telebot.apihelper._make_request', side_effect=AssertionError('Unexpected live Telegram call'))
     self.api.start()
     self.addCleanup(self.api.stop)
@@ -105,7 +109,16 @@ class BotTests(unittest.TestCase):
     self.assertFalse(self.bot.shop_bot.threaded)
     self.assertFalse(self.bot.admin_bot.threaded)
     self.assertTrue(Path(self.bot.QR_IMAGE_PATH).is_file())
-    self.assertNotIn('infinity_polling', (ROOT / 'tl' / 'tl.py').read_text())
+    self.assertNotIn('infinity_polling', (ROOT / 'api' / 'index.py').read_text())
+
+  def test_initialization_is_idempotent_and_registers_each_handler_once(self):
+    before = (len(self.bot.shop_bot.message_handlers), len(self.bot.shop_bot.callback_query_handlers), len(self.bot.admin_bot.message_handlers), len(self.bot.admin_bot.callback_query_handlers))
+    shop = self.bot.shop_bot
+    self.bot.ensure_runtime()
+    self.assertIs(shop, self.bot.shop_bot)
+    after = (len(self.bot.shop_bot.message_handlers), len(self.bot.shop_bot.callback_query_handlers), len(self.bot.admin_bot.message_handlers), len(self.bot.admin_bot.callback_query_handlers))
+    self.assertEqual(before, (3, 4, 3, 2))
+    self.assertEqual(after, before)
 
   def test_shop_start_is_dispatched_and_duplicate_is_not(self):
     update = self.update(message_update(10, '/start'))
@@ -130,7 +143,8 @@ class BotTests(unittest.TestCase):
     self.assertEqual(self.bot.store.load()['pending_deposits']['42'], 'WAITING_AMOUNT')
     # A new module starts with empty memory; only Redis has the pending step.
     database = self.bot.store.database
-    self.bot = importlib.reload(self.bot)
+    self.bot._runtime_initialized = False
+    self.bot.ensure_runtime()
     self.bot.store = MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database)
     self.assertEqual(self.bot.pending_deposits, {})
     with patch.object(self.bot.shop_bot, 'send_photo') as photo:
@@ -148,6 +162,29 @@ class BotTests(unittest.TestCase):
     self.assertEqual(self.bot.store.load(), original)
     self.assertFalse(self.bot._processing_update)
     self.assertNotIn(self.bot.store.key + ':lock', self.bot.store.database)
+
+  def test_committed_update_is_acknowledged_when_lock_cleanup_fails(self):
+    store = self.bot.store
+    original = store.command
+
+    def fail_release(*args):
+      if args[:2] == ('EVAL', store.RELEASE):
+        raise StorageError('private-provider-error', code='redis_request_failed')
+      return original(*args)
+
+    with patch.object(store, 'command', side_effect=fail_release):
+      self.assertTrue(self.bot.process_webhook('shop', self.update({'update_id': 12})))
+    self.assertEqual(store.load()['processed_updates']['shop'], [12])
+
+  def test_storage_error_identifies_the_failing_operation(self):
+    for name, operation in (
+        ('lock_acquire', 'transaction'), ('state_load', 'load'), ('state_commit', 'save'),
+    ):
+      failure = StorageError('private-provider-error', code='redis_request_failed')
+      with self.subTest(stage=name), patch.object(self.bot.store, operation, side_effect=failure):
+        with self.assertRaises(StorageError) as error:
+          self.bot.process_webhook('shop', self.update({'update_id': 88}))
+      self.assertEqual(error.exception.stage, name)
 
   def test_callback_query_is_dispatched_and_conversation_step_is_saved(self):
     self.seed(verified_users=[42], user_ref_balances={'42': 30000}, user_ref_deposit_valid={'42': 1})
@@ -187,6 +224,35 @@ class BotTests(unittest.TestCase):
       server.server_close()
       thread.join()
 
+  def test_http_returns_200_after_commit_even_when_cleanup_fails(self):
+    store = self.bot.store
+    original = store.command
+
+    def fail_release(*args):
+      if args[:2] == ('EVAL', store.RELEASE):
+        raise StorageError('private-provider-error', code='redis_request_failed')
+      return original(*args)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+    try:
+      with patch.object(store, 'command', side_effect=fail_release):
+        connection.request('POST', '/api/webhook/shop', body=json.dumps({'update_id': 90}), headers={
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': 'test-secret',
+        })
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(json.loads(response.read())['ok'])
+      self.assertEqual(store.load()['processed_updates']['shop'], [90])
+    finally:
+      connection.close()
+      server.shutdown()
+      server.server_close()
+      thread.join()
+
   def test_duplicate_history_is_bounded(self):
     self.seed(processed_updates={'shop': list(range(2000))})
     self.bot.process_webhook('shop', self.update({'update_id': 2000}))
@@ -212,13 +278,41 @@ class StorageTests(unittest.TestCase):
 
   def test_vercel_refuses_temporary_storage(self):
     with patch.dict(os.environ, {'VERCEL': '1'}):
-      with self.assertRaises(StorageError):
+      with self.assertRaises(StorageError) as error:
         StateStore(self.file, self.sessions)
+    self.assertEqual(error.exception.code, 'redis_not_configured')
 
   def test_incomplete_redis_configuration_is_rejected(self):
     with patch.dict(os.environ, {'UPSTASH_REDIS_REST_URL': 'https://redis.test'}):
       with self.assertRaises(StorageError):
         StateStore(self.file, self.sessions)
+
+  def test_vercel_kv_rest_variable_names_are_supported(self):
+    with patch.dict(os.environ, {
+        'VERCEL': '1', 'KV_REST_API_URL': ' https://redis.test/ ',
+        'KV_REST_API_TOKEN': ' redis-secret ',
+    }):
+      store = StateStore(self.file, self.sessions)
+    self.assertEqual(store.url, 'https://redis.test')
+    self.assertEqual(store.token, 'redis-secret')
+
+  def test_primary_credentials_are_not_mixed_with_kv_credentials(self):
+    with patch.dict(os.environ, {
+        'UPSTASH_REDIS_REST_URL': 'https://primary.test',
+        'KV_REST_API_URL': 'https://other.test', 'KV_REST_API_TOKEN': 'other-token',
+    }):
+      with self.assertRaises(StorageError) as error:
+        StateStore(self.file, self.sessions)
+    self.assertEqual(error.exception.code, 'redis_config_incomplete')
+
+  def test_redis_url_must_be_an_https_origin(self):
+    for url in ('redis://redis.test', 'https://redis.test/set', 'https://redis.test?token=private', 'https://private@redis.test'):
+      with self.subTest(url=url), patch.dict(os.environ, {
+          'UPSTASH_REDIS_REST_URL': url, 'UPSTASH_REDIS_REST_TOKEN': 'private',
+      }):
+        with self.assertRaises(StorageError) as error:
+          StateStore(self.file, self.sessions)
+        self.assertEqual(error.exception.code, 'redis_url_invalid')
 
   def test_distributed_lock_rejects_concurrent_instance(self):
     first = MemoryRedisStore(self.file, self.sessions)
@@ -241,6 +335,36 @@ class StorageTests(unittest.TestCase):
     self.assertEqual(store.database[store.key + ':lock'], 'new-owner')
     self.assertIsNone(store.load())
 
+  def test_cleanup_error_does_not_mask_the_original_transaction_error(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    original = store.command
+
+    def fail_release(*args):
+      if args[:2] == ('EVAL', store.RELEASE):
+        raise StorageError('private-cleanup', code='redis_request_failed')
+      return original(*args)
+
+    with patch.object(store, 'command', side_effect=fail_release):
+      with self.assertRaisesRegex(RuntimeError, 'original-handler-failure'):
+        with store.transaction():
+          raise RuntimeError('original-handler-failure')
+    self.assertFalse(store._mutex.locked())
+
+  def test_cleanup_failure_before_any_commit_is_still_reported(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    original = store.command
+
+    def fail_release(*args):
+      if args[:2] == ('EVAL', store.RELEASE):
+        raise StorageError('private-cleanup', code='redis_request_failed')
+      return original(*args)
+
+    with patch.object(store, 'command', side_effect=fail_release):
+      with self.assertRaises(StorageError):
+        with store.transaction():
+          pass
+    self.assertFalse(store._mutex.locked())
+
   def test_session_files_restore_on_a_fresh_instance(self):
     store = MemoryRedisStore(self.file, self.sessions)
     path = self.sessions / 'product' / 'example.session'
@@ -262,7 +386,7 @@ class StorageTests(unittest.TestCase):
   def test_rest_command_uses_authenticated_json_body(self):
     store = MemoryRedisStore(self.file, self.sessions)
     store.token = 'redis-secret'
-    with patch('tl.storage.urlopen', return_value=io.BytesIO(b'{"result":"OK"}')) as request:
+    with patch('api.index.urlopen', return_value=io.BytesIO(b'{"result":"OK"}')) as request:
       result = StateStore.command(store, 'SET', 'key', 'value')
     self.assertEqual(result, 'OK')
     sent = request.call_args.args[0]
@@ -271,9 +395,56 @@ class StorageTests(unittest.TestCase):
 
   def test_rest_errors_are_not_silently_ignored(self):
     store = MemoryRedisStore(self.file, self.sessions)
-    with patch('tl.storage.urlopen', return_value=io.BytesIO(b'{"error":"denied"}')):
+    with patch('api.index.urlopen', return_value=io.BytesIO(b'{"error":"denied"}')):
       with self.assertRaises(StorageError):
         StateStore.command(store, 'GET', 'key')
+
+  def test_http_failures_have_credential_safe_error_codes(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    for status, expected in ((401, 'redis_auth_failed'), (403, 'redis_permission_denied'), (429, 'redis_rate_limited'), (503, 'redis_http_error')):
+      failure = HTTPError('https://private-url.test', status, 'private-token', {}, io.BytesIO(b'{"error":"private-data"}'))
+      with self.subTest(status=status), patch('api.index.urlopen', side_effect=failure):
+        with self.assertRaises(StorageError) as error:
+          StateStore.command(store, 'SET', 'private-key', 'private-value')
+        self.assertEqual(error.exception.code, expected)
+        self.assertNotIn('private', str(error.exception))
+
+  def test_provider_and_network_errors_are_classified_without_echoing_details(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    for message, expected in (
+        ('NOPERM private-state', 'redis_permission_denied'),
+        ('READONLY private-state', 'redis_permission_denied'),
+        ('ERR max requests limit exceeded private-state', 'redis_rate_limited'),
+        ('NOAUTH private-token', 'redis_auth_failed'),
+    ):
+      with self.subTest(message=message), patch('api.index.urlopen', return_value=io.BytesIO(json.dumps({'error': message}).encode())):
+        with self.assertRaises(StorageError) as error:
+          StateStore.command(store, 'SET', 'key', 'value')
+        self.assertEqual(error.exception.code, expected)
+        self.assertNotIn('private', str(error.exception))
+    with patch('api.index.urlopen', side_effect=URLError('private-url')):
+      with self.assertRaises(StorageError) as error:
+        StateStore.command(store, 'PING')
+    self.assertEqual(error.exception.code, 'redis_request_failed')
+
+  def test_http_400_permission_error_body_is_classified_and_closed(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    body = io.BytesIO(b'{"error":"NOPERM private-token"}')
+    failure = HTTPError('https://private-url.test', 400, 'private-token', {}, body)
+    with patch('api.index.urlopen', side_effect=failure):
+      with self.assertRaises(StorageError) as error:
+        StateStore.command(store, 'SET', 'key', 'value')
+    self.assertEqual(error.exception.code, 'redis_permission_denied')
+    self.assertTrue(body.closed)
+    self.assertNotIn('private', str(error.exception))
+
+  def test_non_json_provider_response_has_a_safe_error_code(self):
+    store = MemoryRedisStore(self.file, self.sessions)
+    for response in (b'not json', b'[]', b'{"unexpected":"private-data"}'):
+      with self.subTest(response=response), patch('api.index.urlopen', return_value=io.BytesIO(response)):
+        with self.assertRaises(StorageError) as error:
+          StateStore.command(store, 'PING')
+        self.assertEqual(error.exception.code, 'redis_response_invalid')
 
 
 class HTTPTests(unittest.TestCase):
@@ -312,7 +483,32 @@ class HTTPTests(unittest.TestCase):
       status, body, _ = self.request('GET', '/api/health')
     self.assertEqual(status, 200)
     self.assertTrue(body['ok'])
+    self.assertEqual(body['version'], APP_VERSION)
     self.assertEqual(self.request('HEAD', '/api/health')[0], 200)
+
+  def test_storage_check_requires_authentication_and_never_dispatches_updates(self):
+    with patch('api.index.StateStore') as factory, patch('api.index.process_webhook') as process:
+      self.assertEqual(self.request('GET', '/api/health?check=storage', headers={'X-Telegram-Bot-Api-Secret-Token': 'wrong'})[0], 403)
+      factory.assert_not_called()
+      store = factory.return_value
+      store.url = 'https://redis.test'
+      store.command.side_effect = ['PONG', 1]
+      status, body, _ = self.request('GET', '/api/health?check=storage')
+      self.assertEqual(status, 200)
+      self.assertEqual(body['check'], 'read-only')
+      self.assertEqual([call.args for call in store.command.call_args_list], [('PING',), ('EVAL', 'return 1', 0)])
+      process.assert_not_called()
+
+  def test_storage_configuration_failure_is_specific_and_private(self):
+    with patch.dict(os.environ, {'VERCEL': '1'}):
+      status, body, _ = self.request('GET', '/api/health?check=storage')
+    self.assertEqual(status, 503)
+    self.assertEqual(body['code'], 'redis_not_configured')
+    with patch('api.index.StateStore', side_effect=StorageError('private-token', code='redis_auth_failed')):
+      with self.assertLogs('api.index', level='ERROR') as logs:
+        status, body, _ = self.request('GET', '/api/health?check=storage')
+    self.assertEqual(body['code'], 'redis_auth_failed')
+    self.assertNotIn('private-token', json.dumps(body) + ''.join(logs.output))
 
   def test_missing_or_wrong_secret_is_forbidden(self):
     for secret in ('', 'wrong', 'é'):
@@ -326,14 +522,16 @@ class HTTPTests(unittest.TestCase):
     for body in ('not json', '[]', '{}', '{"update_id":true}', '{"update_id":-1}'):
       self.assertEqual(self.request(body=body)[0], 400)
     self.assertEqual(self.request(headers={'Content-Type': 'text/plain'})[0], 415)
-    self.assertEqual(self.request(body='x' * (1024 * 1024 + 1))[0], 413)
+    # The server rejects from Content-Length before reading the body. Sending
+    # a full megabyte races its early socket close and can cause BrokenPipe.
+    self.assertEqual(self.request(body='', headers={'Content-Length': str(1024 * 1024 + 1)})[0], 413)
 
   def test_unknown_path(self):
     self.assertEqual(self.request(path='/api/webhook/unknown')[0], 404)
     self.assertEqual(self.request('GET', '/unknown')[0], 404)
 
   def test_both_bot_routes_and_vercel_rewrite_target(self):
-    with patch('tl.tl.process_webhook', return_value=True) as process:
+    with patch('api.index.process_webhook', return_value=True) as process:
       for path, name in (
           ('/api/webhook/shop', 'shop'), ('/api/webhook/admin', 'admin'),
           ('/api?bot=admin', 'admin'), ('/api/index?bot=admin', 'admin'),
@@ -343,23 +541,41 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(process.call_args.args[1].update_id, 123)
 
   def test_duplicate_ack_and_retryable_storage_failure(self):
-    with patch('tl.tl.process_webhook', return_value=False):
+    with patch('api.index.process_webhook', return_value=False):
       self.assertTrue(self.request()[1]['duplicate'])
     for error in (StorageBusy('busy'), StorageError('offline')):
-      with patch('tl.tl.process_webhook', side_effect=error):
+      with patch('api.index.process_webhook', side_effect=error):
         status, _, headers = self.request()
         self.assertEqual(status, 503)
         self.assertEqual(headers['Retry-After'], '2')
-    with patch('tl.tl.process_webhook', side_effect=RuntimeError('private details')):
+    with patch('api.index.process_webhook', side_effect=RuntimeError('private details')):
       status, body, _ = self.request()
       self.assertEqual(status, 500)
       self.assertNotIn('private details', json.dumps(body))
 
+  def test_webhook_storage_errors_expose_codes_not_credentials(self):
+    with patch('api.index.process_webhook', side_effect=StorageError('private-token', code='redis_permission_denied', stage='state_commit')):
+      with self.assertLogs('api.index', level='ERROR') as logs:
+        status, body, _ = self.request()
+    self.assertEqual(status, 503)
+    self.assertEqual(body['code'], 'redis_permission_denied')
+    self.assertEqual(body['stage'], 'state_commit')
+    self.assertIn('stage=state_commit', ''.join(logs.output))
+    self.assertNotIn('private-token', json.dumps(body) + ''.join(logs.output))
+
+  def test_missing_bot_settings_have_a_safe_runtime_error(self):
+    with patch.dict(os.environ, {'SHOP_TOKEN': ''}), patch.object(application, '_runtime_initialized', False):
+      status, body, _ = self.request()
+    self.assertEqual(status, 503)
+    self.assertEqual(body['code'], 'bot_config_missing')
+    self.assertEqual(body['stage'], 'runtime_init')
+
 
 class DeploymentTests(unittest.TestCase):
   def test_registration_uses_two_authenticated_webhooks_without_dropping_updates(self):
-    with patch.dict(os.environ, {**TEST_ENV, 'WEBHOOK_BASE_URL': 'https://bot.example.test'}), patch.object(sys, 'argv', ['set_webhooks']), patch('scripts.set_webhooks.telegram_request', return_value={}) as telegram:
+    with patch.dict(os.environ, {**TEST_ENV, 'WEBHOOK_BASE_URL': 'https://bot.example.test'}), patch.object(sys, 'argv', ['set_webhooks']), patch('api.index.deployment_preflight') as preflight, patch('api.index.telegram_request', return_value={}) as telegram:
       set_webhooks.main()
+    preflight.assert_called_once_with('https://bot.example.test', 'test-secret')
     webhooks = [call for call in telegram.call_args_list if call.args[1] == 'setWebhook']
     self.assertEqual(len(webhooks), 2)
     for call, name in zip(webhooks, ('shop', 'admin')):
@@ -368,6 +584,59 @@ class DeploymentTests(unittest.TestCase):
       self.assertEqual(payload['secret_token'], 'test-secret')
       self.assertEqual(payload['max_connections'], 1)
       self.assertFalse(payload['drop_pending_updates'])
+
+  def test_failed_preflight_does_not_change_webhook_registration(self):
+    with patch.dict(os.environ, TEST_ENV), patch('api.index.deployment_preflight', side_effect=RuntimeError('Wrong deployed version')), patch('api.index.telegram_request') as telegram:
+      with self.assertRaises(RuntimeError):
+        application.configure_webhooks('https://bot.example.test')
+    telegram.assert_not_called()
+
+  def test_preflight_rejects_old_liveness_response(self):
+    with patch('api.index.urlopen', return_value=io.BytesIO(b'{"ok":true,"service":"telegram-webhooks"}')):
+      with self.assertRaises(RuntimeError):
+        application.deployment_preflight('https://bot.example.test', 'test-secret')
+
+  def test_single_file_contains_handlers_storage_and_no_local_imports(self):
+    source = (ROOT / 'api' / 'index.py').read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+      if isinstance(node, ast.ImportFrom):
+        self.assertFalse((node.module or '').startswith(('tl.', 'api.', 'scripts.')))
+    self.assertFalse((ROOT / 'tl' / 'tl.py').exists())
+    self.assertFalse((ROOT / 'tl' / 'storage.py').exists())
+    self.assertIn('def shop_start(', source)
+    self.assertIn('class StateStore:', source)
+    self.assertNotIn('exec(', source)
+
+  def test_single_file_import_without_credentials_or_optional_dependencies(self):
+    script = (
+        'import sys\n'
+        'from api import index\n'
+        'assert not index._runtime_initialized\n'
+        'assert "telebot" not in sys.modules\n'
+        'assert "telethon" not in sys.modules\n'
+        'assert "qrcode" not in sys.modules\n'
+        'print(index.APP_VERSION)\n'
+    )
+    result = subprocess.run([sys.executable, '-c', script], cwd=ROOT, env={}, capture_output=True, text=True, timeout=20)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn(APP_VERSION, result.stdout)
+
+  def test_entrypoint_runs_when_copied_without_the_repository(self):
+    with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+      entrypoint = Path(directory) / 'webhook.py'
+      entrypoint.write_text((ROOT / 'api' / 'index.py').read_text())
+      script = (
+          'import runpy, sys\n'
+          'app = runpy.run_path(sys.argv[1])\n'
+          'assert not app["_runtime_initialized"]\n'
+          'assert "telebot" not in sys.modules\n'
+          'assert callable(app["handler"])\n'
+          'print(app["APP_VERSION"])\n'
+      )
+      result = subprocess.run([sys.executable, '-c', script, str(entrypoint)], cwd=directory, env={}, capture_output=True, text=True, timeout=20)
+    self.assertEqual(result.returncode, 0, result.stderr)
+    self.assertIn(APP_VERSION, result.stdout)
 
   def test_vercel_routes_and_duration_match_the_lock(self):
     config = json.loads((ROOT / 'vercel.json').read_text())

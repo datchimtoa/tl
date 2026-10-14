@@ -1,5 +1,6 @@
 .env
 secret.md
+sec.md
 .env.*
 !.env.example
 .vercel/

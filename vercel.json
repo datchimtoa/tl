@@ -4,8 +4,8 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 60,
-      "includeFiles": "tl/**",
-      "excludeFiles": "{.env*,**/secret.md,.test-deps/**,.runtime/**,tests/**,scripts/**,**/__pycache__/**,tl.zip,tl/.trashed-*,tl/bot_data.json,tl/sessions_storage/**}"
+      "includeFiles": "tl/qr.jpg",
+      "excludeFiles": "{.env*,**/secret.md,**/sec.md,.test-deps/**,.runtime/**,tests/**,scripts/**,**/__pycache__/**,tl.zip,tl/**/*.py,tl/.trashed-*,tl/bot_data.json,tl/sessions_storage/**}"
     }
   },
   "rewrites": [

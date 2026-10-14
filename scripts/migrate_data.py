@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from tl.storage import StateStore
+from api.index import StateStore
 
 
 def migrate(data_file, session_root, overwrite=False):

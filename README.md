@@ -1,14 +1,28 @@
-# Telegram bots on Vercel (webhook mode)
+# Single-file Telegram bots on Vercel
 
-The existing shop and admin handlers are in `tl/tl.py`. Long polling has been
-removed. Vercel serves `api/index.py`, which authenticates Telegram updates and
-dispatches them synchronously to the correct bot:
+All application code is now in **`api/index.py`**: the shop/admin handlers,
+durable storage, HTTP webhook server, diagnostics, and webhook registration
+command. There are no imports from separate local bot/storage modules, no
+compressed/embedded source, and no polling loop. Vercel loads the standard
+library `handler` class and dispatches updates synchronously to the right bot:
 
 | URL | Purpose |
 | --- | --- |
 | `GET /api/health` | Liveness check (does not verify Telegram or Redis connectivity) |
+| `GET /api/health?check=storage` | Authenticated, read-only Redis connectivity/scripting check |
 | `POST /api/webhook/shop` | Shop bot updates |
 | `POST /api/webhook/admin` | Admin bot updates |
+
+The current production URLs are:
+
+- Shop: `https://tl-wine.vercel.app/api/webhook/shop`
+- Admin: `https://tl-wine.vercel.app/api/webhook/admin`
+
+`requirements.txt` installs the existing third-party dependencies, and
+`vercel.json` maps both URLs to this one function. `tl/qr.jpg` is an optional
+payment QR asset; if it is absent, the existing QR generation fallback is used.
+The scripts directory contains only optional compatibility/migration utilities,
+not runtime dependencies.
 
 ## 1. Replace exposed credentials
 
@@ -38,6 +52,15 @@ Variables** for the production environment:
 | `BOT_STORAGE_KEY` | No | State namespace; defaults to `tl:state` |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | For session checks | Telethon credentials |
 | `BANK_NAME`, `BANK_STK`, `ACCOUNT_NAME` | No | Override the existing bank settings |
+
+The alternative `KV_REST_API_URL` / `KV_REST_API_TOKEN` pair is also supported
+when neither `UPSTASH_REDIS_REST_*` variable is set. A partially configured
+primary pair is rejected rather than mixed with another database's credentials.
+Use an HTTPS REST origin, not a `redis://` connection string.
+
+**Local `.env` values are not uploaded to Vercel.** Set these variables for
+**Production** and redeploy after every environment-variable change. Values
+configured only for Development or Preview do not affect the production bot.
 
 Generate `WEBHOOK_SECRET` with:
 
@@ -83,13 +106,14 @@ have no existing data, no migration is needed: the original initial state
 
 ## 3. Deploy
 
-Commit the extracted `tl/` source **and the new configuration/API files** to
-your repository; the original repository tracked only `tl.zip`.
+Commit the new single-file source **and configuration**, including removal of
+the old `tl/tl.py` and `tl/storage.py`, before deploying. Uploading or registering
+a URL does not update the code running at that URL.
 
 Import the repository into Vercel with:
 
 - **Root directory:** the repository root containing `vercel.json`, `api/`,
-  `requirements.txt`, and the nested `tl/` package—not the inner `tl/` folder.
+  `requirements.txt`, and `public/`—not the inner `api/` or `tl/` folder.
 - **Framework preset:** Other.
 - **Build command:** leave unset. The static output directory is set to
   `public` by `vercel.json`; do not change it to the repository root.
@@ -101,7 +125,9 @@ Deploy after setting the environment variables. Check:
 curl https://your-project.vercel.app/api/health
 ```
 
-Expected response: `{"ok": true, "service": "telegram-webhooks"}`.
+Expected response includes `"ok": true`, `"service": "telegram-webhooks"`,
+and **`"version": "single-file-webhook-v1"`**. If the version is missing, the
+old multi-file deployment is still serving requests.
 
 The production webhook URLs must be publicly accessible. Disable Vercel
 Deployment Protection for these production endpoints, or configure an
@@ -116,23 +142,84 @@ in, and load it into your shell (`set -a; . ./.env; set +a`). The application
 does not automatically load `.env` files.
 
 ```sh
-export WEBHOOK_BASE_URL=https://your-project.vercel.app
-python -m scripts.set_webhooks
-python -m scripts.set_webhooks --info
+python -m api.index --set-webhooks --url https://tl-wine.vercel.app
+python -m api.index --webhook-info
 ```
 
-`WEBHOOK_BASE_URL` is used by this local setup script; it is not required by
-the Vercel function. Use your stable production domain, not a temporary preview
-URL. The script registers both endpoints with `secret_token`, limits each bot
-to one webhook connection, and subscribes to `message` and `callback_query`.
+Webhook setup is built into the **same file**. It first checks the deployed
+version and authenticated Redis diagnostic; if the old code is still deployed
+or storage fails, it refuses to change Telegram's registration. Use your stable
+production domain, not a temporary preview URL. The command registers both
+endpoints with `secret_token`, limits each bot to one webhook connection, and
+subscribes to `message` and `callback_query`.
 It also configures the shop's command menu. Queued updates are preserved by
 default. Use `--drop-pending-updates` only if you intentionally want to discard
 them. Registering a webhook switches Telegram away from `getUpdates`; keep
-all old polling instances stopped.
+all old polling instances stopped. `WEBHOOK_BASE_URL` is an alternative to
+`--url` for this local command, not a runtime requirement.
+
+The old `python -m scripts.set_webhooks` / `--info` commands remain wrappers
+for compatibility. Do not put tokens into webhook URL query strings or browser
+address bars; this command sends them only to Telegram's official HTTPS API.
 
 Webhook registration is **not** performed on every cold start. Re-run setup
 if your public URL, bot tokens, or webhook secret changes. Send `/start` to each
-bot afterward, and check `--info` plus Vercel logs for delivery failures.
+bot afterward, and check `--webhook-info` plus Vercel logs for delivery failures.
+
+### Troubleshooting 503 and queued updates
+
+`pending=129` means Telegram has 129 updates waiting for successful delivery;
+it does not mean registration failed. Fix the endpoint instead of discarding
+the queue. A historical `last_error_message` may remain after recovery, so
+also watch whether the pending count decreases.
+
+Repeated requests approximately every second can be Telegram retries of the
+same failed update; there is no scheduled polling loop in the application.
+Correct credentials do not rule out runtime failures. Inspect the webhook
+response or function log rather than assuming an environment-variable problem.
+New logs identify both the safe `code` and `stage` (`lock_acquire`, `state_load`,
+`handler`, `state_commit`, or `lock_release`). No credentials or message text
+are included. A successful durable commit is acknowledged even if lock cleanup
+fails; the remaining lock expires automatically. A cleanup failure no longer
+masks the original handler exception.
+
+Verify that the diagnostic update actually reached production: `/api/health`
+must include `"version": "single-file-webhook-v1"`, and responses
+also include an `X-Bot-Version` header. Older versions silently ignore the
+`check=storage` parameter and return liveness, which is **not** a Redis test.
+
+With the same `WEBHOOK_SECRET` exported locally, check Redis from the **deployed**
+environment without changing balances, inventory, locks, or queued messages:
+
+```sh
+curl --silent --show-error \
+  -H "X-Telegram-Bot-Api-Secret-Token: $WEBHOOK_SECRET" \
+  'https://your-project.vercel.app/api/health?check=storage'
+```
+
+Successful response includes `"ok": true`, `"storage": "redis"`,
+`"check": "read-only"`, and the diagnostic `version`.
+This verifies connectivity and access to scripting, **not write permission**.
+The token must still be the read/write token to process bot updates. The
+unqualified `/api/health` remains a lightweight liveness check.
+
+Failures return a credential-safe `code`, also recorded in Vercel function logs:
+
+| Code | Action |
+| --- | --- |
+| `webhook_secret_not_configured` | Set a valid `WEBHOOK_SECRET` in Production and redeploy. |
+| `bot_config_missing` / `bot_config_invalid` | Inspect SHOP_TOKEN, ADMIN_TOKEN and numeric ADMIN_ID; logs never include their values. |
+| `redis_not_configured` / `redis_config_incomplete` | Set a complete REST URL/token pair in Production and redeploy. |
+| `redis_url_invalid` | Use the database's HTTPS REST origin, without a path/query or surrounding quotes. |
+| `redis_auth_failed` | Check that the REST token belongs to that database and is current. |
+| `redis_permission_denied` | Replace a read-only/restricted token with one permitted to use GET, SET and EVAL. |
+| `redis_rate_limited` | Check the provider's quota/rate limits and allow retries. |
+| `redis_request_failed` / `redis_http_error` | Check database availability, endpoint and outbound connectivity. |
+| `storage_busy` | Another update is holding the lock; allow Telegram to retry. Do not delete a live lock. |
+| `storage_lock_expired` | Processing ran past its lock lease; inspect slow operations and worker requirements. |
+
+Never paste bot tokens, Redis tokens, or the webhook secret into public logs or
+issues. Share only the safe response code and relevant redacted Vercel log line.
 
 ## Local development and tests
 
