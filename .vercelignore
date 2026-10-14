@@ -1,0 +1,13 @@
+.git/
+.env*
+secret.md
+**/secret.md
+.test-deps/
+tests/
+scripts/
+**/__pycache__/
+**/.trashed-*
+**/bot_data.json
+**/sessions_storage/
+.runtime/
+tl.zip

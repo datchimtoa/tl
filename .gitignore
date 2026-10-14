@@ -1,0 +1,14 @@
+.env
+secret.md
+.env.*
+!.env.example
+.vercel/
+.test-deps/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+bot_data.json
+sessions_storage/
+.runtime/
+.trashed-*
+*.zip

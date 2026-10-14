@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "public",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 60,
+      "includeFiles": "tl/**",
+      "excludeFiles": "{.env*,**/secret.md,.test-deps/**,.runtime/**,tests/**,scripts/**,**/__pycache__/**,tl.zip,tl/.trashed-*,tl/bot_data.json,tl/sessions_storage/**}"
+    }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/api" },
+    { "source": "/api/health", "destination": "/api" },
+    { "source": "/api/webhook/shop", "destination": "/api?bot=shop" },
+    { "source": "/api/webhook/admin", "destination": "/api?bot=admin" }
+  ]
+}
