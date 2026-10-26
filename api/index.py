@@ -31,6 +31,19 @@ logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 1024 * 1024
 APP_VERSION = 'single-file-webhook-v1'
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Bounds a single Telethon session check so one dead account cannot use up the
+# function's 60-second budget.
+SESSION_CHECK_TIMEOUT = 10
+SESSION_SYSTEM_VERSION = '4.16.30-vx'
+# A purchase request may verify at most this many stock accounts against
+# Telegram. Every check is a live network round trip inside one invocation.
+MAX_SESSION_CHECKS_PER_PURCHASE = 10
+# A single broadcast can reach every user; cap it per invocation so the request
+# stays inside the 60-second function limit. Run it again for the next batch.
+MAX_BROADCAST_RECIPIENTS = 100
+# Verified referrals pay a random VND bonus to the referrer, but only for this
+# many referrals per account: an uncapped bonus can be farmed with new accounts.
+REFERRAL_BONUS_LIMIT = 100
 _runtime_lock = threading.Lock()
 _runtime_initialized = False
 _processing_update = False
@@ -363,26 +376,69 @@ def restore_session_files(account):
 
 
 # --- FIX LỖI EVENT LOOP & TELETHON DISCONNECT ---
-async def check_single_session(session_path, api_id=None, api_hash=None):
+DEAD_SESSION_MARKERS = (
+    "frozen", "deactivated", "banned", "ban", "auth_key", "authkey",
+    "restricted", "session", "invalid",
+)
+
+
+async def check_single_session(
+    session_path, api_id=None, api_hash=None, client_factory=None
+):
+  """Report whether a saved session is still usable.
+
+  The stricter checks (missing file, user flags, a sample dialog request) come
+  from the original single-file bot. Unlike that bot, the connect is bounded by
+  a timeout and the client is always disconnected: a Vercel request must never
+  hang on a dead session.
+  """
   api_id = api_id or DEFAULT_API_ID
   api_hash = api_hash or DEFAULT_API_HASH
   if not api_id or not api_hash:
     raise ValueError("Set TELEGRAM_API_ID and TELEGRAM_API_HASH for session checks.")
-  client = TelegramClient(session_path, api_id, api_hash)
+  if not session_path or not os.path.exists(session_path):
+    return False, "File session không tồn tại"
+
+  factory = client_factory or TelegramClient
+  client = factory(
+      session_path, api_id, api_hash, system_version=SESSION_SYSTEM_VERSION
+  )
   try:
-    await client.connect()
+    await asyncio.wait_for(client.connect(), timeout=SESSION_CHECK_TIMEOUT)
     if not await client.is_user_authorized():
-      return False, "Unauthorized"
+      return False, "Unauthorized/Session Die"
+
     user = await client.get_me()
+    if not user:
+      return False, "No user data"
+    if getattr(user, "deactivated", False) or getattr(user, "restricted", False):
+      return False, "Deactivated/Frozen"
+
+    # A readable dialog list proves the session is not silently frozen.
+    try:
+      async for _ in client.iter_dialogs(limit=1):
+        break
+    except Exception as inner:
+      text = str(inner).lower()
+      if any(marker in text for marker in DEAD_SESSION_MARKERS):
+        return False, f"Frozen/Invalid session: {inner}"
+
     return True, user
-  except (AuthKeyUnregisteredError, UserDeactivatedBanError):
-    return False, "Banned/Deactivated"
+  except (
+      AuthKeyUnregisteredError,
+      UserDeactivatedBanError,
+      SessionRevokedError,
+  ):
+    return False, "Banned/Deactivated/Invalid Session"
   except Exception as e:
+    text = str(e).lower()
+    if any(marker in text for marker in DEAD_SESSION_MARKERS):
+      return False, f"Frozen/Invalid: {e}"
     return False, str(e)
   finally:
     try:
       if client.is_connected():
-        await client.disconnect()
+        await asyncio.wait_for(client.disconnect(), timeout=5)
     except Exception:
       pass
 
@@ -395,6 +451,16 @@ def run_async_check(session_path, api_id, api_hash):
         check_single_session(session_path, api_id, api_hash)
     )
   finally:
+    # Cancel anything a timed-out session check left pending before closing.
+    try:
+      pending = asyncio.all_tasks(loop)
+      for task in pending:
+        task.cancel()
+      if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+      pass
+    asyncio.set_event_loop(None)
     loop.close()
   return res
 
@@ -404,7 +470,7 @@ def get_main_keyboard():
   markup.row("🛒 Mua Hàng", "💰 Nạp Tiền")
   markup.row("💸 Rút Tiền", "🔗 Link Ref")
   markup.row("🎁 Nhập Code", "🏆 Top Ref/Nạp")
-  markup.row("ℹ️ Thông Tin")
+  markup.row("🛒 Đơn acc", "ℹ️ Thông Tin")
   return markup
 
 
@@ -438,6 +504,23 @@ def shop_link_info(message):
       "📖 **CÁCH NUÔI ACC TELEGRAM & THÔNG TIN NHÓM:**\n\n"
       "👉 Tham gia nhóm hướng dẫn chi tiết tại đây:\n"
       "🔗 https://t.me/banacctele250"
+  )
+  try:
+    shop_bot.send_message(
+        message.chat.id,
+        text,
+        parse_mode="Markdown",
+        disable_web_page_preview=False,
+    )
+  except Exception:
+    pass
+
+
+def shop_donacc(message):
+  text = (
+      "📦 **LINK NHÓM ĐƠN ACC:**\n\n"
+      "👉 Bấm vào đây để tham gia nhóm:\n"
+      f"🔗 {DON_ACC_GROUP_URL}"
   )
   try:
     shop_bot.send_message(
@@ -554,18 +637,36 @@ def verify_join_callback(call):
     if is_first_time_verified and not user_data[uid].get("ref_counted", False):
       user_data[uid]["ref_counted"] = True
       user_refs_count[referrer_id] = user_refs_count.get(referrer_id, 0) + 1
-      user_ref_balances[referrer_id] = (
-          user_ref_balances.get(referrer_id, 0) + 500
-      )
-      try:
-        shop_bot.send_message(
-            referrer_id,
-            f"🎉 **CÓ REF MỚI THÀNH CÔNG!**\n\n👤 Thành viên `{name}` ({username})"
-            " đã hoàn tất xác minh.\n🪙 Thưởng: **+500 xu ref**",
-            parse_mode="Markdown",
+      # A verified referral used to pay a flat 500 ref coins. It now pays a
+      # random VND bonus, but only for the first REFERRAL_BONUS_LIMIT verified
+      # referrals of an account: an uncapped random bonus could be farmed by
+      # creating accounts without limit.
+      if user_refs_count[referrer_id] <= REFERRAL_BONUS_LIMIT:
+        ref_bonus_vnd = random.randint(100, 500)
+        user_balances[referrer_id] = (
+            user_balances.get(referrer_id, 0) + ref_bonus_vnd
         )
-      except Exception:
-        pass
+        try:
+          shop_bot.send_message(
+              referrer_id,
+              f"🎉 **CÓ REF MỚI THÀNH CÔNG!**\n\n"
+              f"👤 Thành viên `{name}` ({username}) đã hoàn tất xác minh.\n"
+              f"💵 Thưởng nóng: **+{ref_bonus_vnd:,} VNĐ** vào số dư!",
+              parse_mode="Markdown",
+          )
+        except Exception:
+          pass
+      else:
+        try:
+          shop_bot.send_message(
+              referrer_id,
+              f"🎉 **CÓ REF MỚI THÀNH CÔNG!**\n\n👤 Thành viên `{name}`"
+              f" ({username}) đã hoàn tất xác minh.\n👥 Tổng ref:"
+              f" **{user_refs_count[referrer_id]}**",
+              parse_mode="Markdown",
+          )
+        except Exception:
+          pass
 
   save_data()
   try:
@@ -640,6 +741,11 @@ def handle_shop_text(message):
       pass
     return
   if uid not in verified_users:
+    # The "Đơn acc" shortcut stays available before verification: the join
+    # requirement exists to reach exactly that group.
+    if (message.text or "").strip() == "🛒 Đơn acc":
+      shop_donacc(message)
+      return
     try:
       shop_bot.reply_to(
           message,
@@ -668,6 +774,7 @@ def handle_shop_text(message):
   if "Mua Hàng" in text:
     pending_deposits.pop(uid, None)
     pending_withdraws.pop(uid, None)
+    pending_buy.pop(uid, None)
     clean_empty_products()
     markup = types.InlineKeyboardMarkup()
     markup.add(
@@ -695,6 +802,7 @@ def handle_shop_text(message):
   elif "Top Ref/Nạp" in text:
     pending_deposits.pop(uid, None)
     pending_withdraws.pop(uid, None)
+    pending_buy.pop(uid, None)
     sorted_refs = sorted(
         user_refs_count.items(), key=lambda x: x[1], reverse=True
     )[:10]
@@ -753,6 +861,7 @@ def handle_shop_text(message):
 
   elif "Rút Tiền" in text:
     pending_deposits.pop(uid, None)
+    pending_withdraws.pop(uid, None)
     pending_buy.pop(uid, None)
     ref_coin = user_ref_balances.get(uid, 0)
     valid_refs = user_ref_deposit_valid.get(uid, 0)
@@ -783,6 +892,7 @@ def handle_shop_text(message):
 
   elif "Link Ref" in text:
     pending_deposits.pop(uid, None)
+    pending_withdraws.pop(uid, None)
     pending_buy.pop(uid, None)
     bot_info = shop_bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
@@ -801,6 +911,7 @@ def handle_shop_text(message):
 
   elif "Nhập Code" in text:
     pending_deposits.pop(uid, None)
+    pending_withdraws.pop(uid, None)
     pending_buy.pop(uid, None)
     try:
       shop_bot.send_message(
@@ -813,8 +924,16 @@ def handle_shop_text(message):
     pending_withdraws[uid] = {"step": "WAITING_GIFTCODE"}
     return
 
+  elif "Đơn acc" in text:
+    pending_deposits.pop(uid, None)
+    pending_withdraws.pop(uid, None)
+    pending_buy.pop(uid, None)
+    shop_donacc(message)
+    return
+
   elif "Thông Tin" in text:
     pending_deposits.pop(uid, None)
+    pending_withdraws.pop(uid, None)
     pending_buy.pop(uid, None)
     u_info = user_data.get(uid, {})
     name = message.from_user.first_name
@@ -918,7 +1037,9 @@ def handle_shop_text(message):
       pass
     return
 
-  # Xử lý Nhập Giftcode
+  # Xử lý Nhập Giftcode ("Nhập Code" stores its step in pending_withdraws; the
+  # old pending_buy lookup meant a mistyped code left the user stuck in
+  # WAITING_QTY, so every later message was parsed as a quantity.)
   if (
       uid in pending_withdraws
       and pending_withdraws[uid].get("step") == "WAITING_GIFTCODE"
@@ -1229,6 +1350,152 @@ def callback_shop_categories(call):
       pass
 
 
+def session_credentials(account):
+  """Return the app credentials recorded next to a session file, if any."""
+  api_id, api_hash = DEFAULT_API_ID, DEFAULT_API_HASH
+  json_path = account.get("json_path")
+  if json_path and os.path.exists(json_path):
+    try:
+      with open(json_path, "r", encoding="utf-8") as stream:
+        credentials = json.load(stream)
+      api_id = credentials.get("app_id", api_id)
+      api_hash = credentials.get("app_hash", api_hash)
+    except Exception:
+      pass
+  return api_id, api_hash
+
+
+def collect_live_accounts(uid, product, qty):
+  """Take up to `qty` still-working accounts out of a product's stock.
+
+  Accounts in stock are never guaranteed to work, so each one is verified
+  before it is sold; dead ones are deleted from stock. Returns the accounts
+  that could NOT be delivered, so the caller can refund them.
+  """
+  verified = []
+  attempts = 0
+  budget_exhausted = False
+  try:
+    progress = shop_bot.send_message(
+        uid,
+        f"⏳ Đang kiểm tra acc...\nTổng acc sống: 0 / Mục tiêu {qty}",
+    )
+  except Exception:
+    progress = None
+
+  while len(verified) < qty and product["stock"]:
+    if attempts >= MAX_SESSION_CHECKS_PER_PURCHASE:
+      budget_exhausted = True
+      break
+    account = product["stock"].pop(0)
+    attempts += 1
+    restore_session_files(account)
+    if not os.path.exists(account["session_path"]):
+      continue
+
+    api_id, api_hash = session_credentials(account)
+    is_live, _ = run_async_check(account["session_path"], api_id, api_hash)
+    if is_live:
+      verified.append(account)
+    else:
+      # Drop the dead session instead of selling it: the file was just
+      # restored from storage and is no longer needed.
+      for key in ("session_path", "json_path"):
+        try:
+          path = account.get(key)
+          if path and os.path.exists(path):
+            os.remove(path)
+        except Exception:
+          pass
+
+    if progress:
+      try:
+        shop_bot.edit_message_text(
+            f"🔍 Đang kiểm tra acc...\n🟢 Sống: {len(verified)} | 🔴 Die:"
+            f" {attempts - len(verified)}\n📦 Tổng acc sống: {len(verified)}/{qty}",
+            chat_id=uid,
+            message_id=progress.message_id,
+          )
+      except Exception:
+        pass
+
+  if budget_exhausted and len(verified) < qty:
+    try:
+      shop_bot.send_message(
+          uid,
+          "⚠️ Đã kiểm tra tối đa"
+          f" {MAX_SESSION_CHECKS_PER_PURCHASE} acc trong một lượt. Những acc"
+          " còn lại trong kho sẽ được kiểm tra ở lượt mua sau.",
+      )
+    except Exception:
+      pass
+  return verified
+
+
+def refund_undelivered(uid, qty, price, delivered_count, total_price):
+  """Refund the part of a purchase that could not be delivered."""
+  missing = qty - delivered_count
+  refund = total_price - delivered_count * price
+  if missing <= 0 or refund <= 0:
+    return total_price
+  user_balances[uid] = user_balances.get(uid, 0) + refund
+  try:
+    shop_bot.send_message(
+        uid,
+        f"⚠️ Kho không đủ acc sống! Đã hoàn lại **{refund:,} VNĐ** cho"
+        f" **{missing}** acc thiếu.",
+    )
+  except Exception:
+    pass
+  return total_price - refund
+
+
+def log_order_to_group(category, product, qty, buyer_name, buyer_username, total_price):
+  """Post the order to the "Đơn acc" group; never fail the purchase for it."""
+  chat_id = DON_MUA_GROUP_CHAT_ID
+  if chat_id in (None, ''):
+    return
+  try:
+    shop_bot.send_message(
+        chat_id,
+        f"🛒 **THÔNG TIN ĐƠN HÀNG MỚI ({category})**\n\n"
+        f"🏷️ **Tên sản phẩm:** {product['name']}\n"
+        f"📦 **Số lượng mua:** {qty}\n"
+        f"👤 **Tên / Username:** {buyer_username} ({buyer_name})\n"
+        f"💵 **Số tiền:** {total_price:,} VNĐ\n"
+        f"⏰ **Thời gian:** {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
+        parse_mode="Markdown",
+    )
+  except Exception:
+    pass
+
+
+def audit_tele_stock(product, limit=None):
+  """Split a Telegram product's stock into (still-working, dead) accounts.
+
+  `limit` bounds how many accounts are checked in one call, because each check
+  is a network round trip. Unchecked accounts are simply kept as assumed-live.
+  """
+  live_stock = []
+  die_count = 0
+  stock = product["stock"]
+  to_check = stock if limit is None else stock[:limit]
+  for acc in to_check:
+    restore_session_files(acc)
+    if not os.path.exists(acc["session_path"]):
+      die_count += 1
+      continue
+    api_id, api_hash = session_credentials(acc)
+    is_live, _ = run_async_check(acc["session_path"], api_id, api_hash)
+    if is_live:
+      live_stock.append(acc)
+    else:
+      die_count += 1
+  # Accounts beyond the limit were not checked, so they stay in stock.
+  live_stock.extend(stock[len(to_check):])
+  return live_stock, die_count
+
+
 def callback_confirm_buy(call):
   uid = call.from_user.id
   if uid not in pending_buy or pending_buy[uid].get("step") != "CONFIRM_BUY":
@@ -1282,6 +1549,11 @@ def callback_confirm_buy(call):
   user_balances[uid] = user_bal - total_price
   save_data()
 
+  buyer_name = call.from_user.first_name
+  buyer_username = (
+      f"@{call.from_user.username}" if call.from_user.username else f"ID: {uid}"
+  )
+
   try:
     shop_bot.answer_callback_query(call.id, "✅ Đang xử lý...")
     shop_bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1289,10 +1561,19 @@ def callback_confirm_buy(call):
     pass
 
   if cat == "tele":
-    live_found = []
-    for _ in range(qty):
-      if product["stock"]:
-        live_found.append(product["stock"].pop(0))
+    live_found = collect_live_accounts(uid, product, qty)
+    if len(live_found) < qty:
+      total_price = refund_undelivered(uid, qty, product["price"], len(live_found), total_price)
+      if not live_found:
+        save_data()
+        shop_bot.send_message(
+            uid,
+            "❌ Rất tiếc, kho hiện tại tạm hết acc sống. Tiền đã được hoàn lại"
+            " vào tài khoản!",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+      qty = len(live_found)
     save_data()
 
     zip_buffer = io.BytesIO()
@@ -1330,6 +1611,7 @@ def callback_confirm_buy(call):
         reply_markup=get_main_keyboard(),
         parse_mode="Markdown",
     )
+    log_order_to_group("TELEGRAM", product, qty, buyer_name, buyer_username, total_price)
 
   elif cat == "umo":
     codes_given = []
@@ -1349,6 +1631,7 @@ def callback_confirm_buy(call):
     shop_bot.send_message(
         uid, msg, reply_markup=get_main_keyboard(), parse_mode="Markdown"
     )
+    log_order_to_group("CODE UMO", product, qty, buyer_name, buyer_username, total_price)
 
   elif cat == "ff":
     ff_given = []
@@ -1368,6 +1651,7 @@ def callback_confirm_buy(call):
     shop_bot.send_message(
         uid, msg, reply_markup=get_main_keyboard(), parse_mode="Markdown"
     )
+    log_order_to_group("ACC FF", product, qty, buyer_name, buyer_username, total_price)
 
 
 # --- ADMIN BOT ---
@@ -1412,7 +1696,9 @@ def admin_broadcast(message):
 
   success = 0
   failed = 0
-  all_users = set(user_balances.keys()).union(verified_users)
+  # Bounded per invocation: unbounded loops exceeded the serverless time limit.
+  targets = sorted(set(user_balances.keys()).union(verified_users))
+  all_users = targets[:MAX_BROADCAST_RECIPIENTS]
 
   admin_bot.send_message(
       message.chat.id, f"⏳ Đang gửi thông báo tới {len(all_users)} user..."
@@ -1435,6 +1721,74 @@ def admin_broadcast(message):
       f" bại: **{failed}**",
       parse_mode="Markdown",
   )
+
+
+def admin_resettop(message):
+  args = message.text.split()
+  if len(args) < 2:
+    admin_bot.reply_to(
+        message,
+        "⚠️ Cú pháp không đúng!\n- `/resettop ref` (Reset top giới thiệu)\n-"
+        " `/resettop dep` (Reset top nạp tiền)\n- `/resettop all` (Reset cả hai)",
+        parse_mode="Markdown",
+    )
+    return
+
+  target = args[1].lower()
+  # Rebind instead of .clear(): the module-level names must point at the new
+  # dicts so the snapshot written by save_data() contains the reset tables.
+  global user_refs_count, user_total_deposits
+  if target == "ref":
+    user_refs_count = {}
+    event_name = "Top Giới Thiệu (Ref)"
+  elif target == "dep":
+    user_total_deposits = {}
+    event_name = "Top Nạp Tiền"
+  elif target == "all":
+    user_refs_count = {}
+    user_total_deposits = {}
+    event_name = "Toàn Bộ Bảng Xếp Hạng (Ref & Nạp)"
+  else:
+    admin_bot.reply_to(
+        message,
+        "❌ Lựa chọn không hợp lệ! Dùng: `ref`, `dep` hoặc `all`.",
+        parse_mode="Markdown",
+    )
+    return
+
+  save_data()
+  admin_bot.reply_to(message, f"✅ Đã reset thành công **{event_name}**!")
+
+  # A broadcast to every user is unbounded work: it is capped per run so the
+  # request stays inside the function's 60-second limit.
+  all_users = set(user_balances.keys()).union(verified_users)
+  notif_text = (
+      f"🏆 **THÔNG BÁO SỰ KIỆN / RESET TOP!**\n\n"
+      f"✨ Bảng vàng **{event_name}** đã chính thức được làm mới (Reset)!\n"
+      "🚀 Mời anh em tiếp tục đua top để nhận những phần quà hấp dẫn từ hệ"
+      " thống nhé!"
+  )
+  for u_id in sorted(all_users)[:MAX_BROADCAST_RECIPIENTS]:
+    try:
+      shop_bot.send_message(u_id, notif_text, parse_mode="Markdown")
+    except Exception:
+      pass
+
+
+def admin_menu_cmd(message):
+  text = (
+      "📋 **DANH SÁCH LỆNH QUẢN LÝ:**\n\n"
+      "• /start - Mở bảng điều khiển admin chính\n"
+      "• /menu - Hiển thị danh sách lệnh này\n"
+      "• /resettop ref - Reset bảng xếp hạng giới thiệu (Ref)\n"
+      "• /resettop dep - Reset bảng xếp hạng nạp tiền\n"
+      "• /resettop all - Reset toàn bộ bảng xếp hạng\n"
+      "• /tb <nội dung> - Gửi thông báo đến toàn bộ người dùng"
+  )
+  try:
+    admin_bot.send_message(message.chat.id, text, parse_mode="Markdown")
+  except Exception:
+    pass
 
 
 def admin_start(message):
@@ -1546,6 +1900,14 @@ def admin_menu_handler(call):
       text += f"• [Umo] {p_info['name']}: {len(p_info['stock'])} code\n"
     for p_id, p_info in ff_products.items():
       text += f"• [FF] {p_info['name']}: {len(p_info['stock'])} acc\n"
+    text += (
+        f"\n📊 **Tổng:** {len(tele_products)} mục Tele"
+        f" ({sum(len(p['stock']) for p in tele_products.values())} acc),"
+        f" {len(umo_products)} mục Umo"
+        f" ({sum(len(p['stock']) for p in umo_products.values())} code),"
+        f" {len(ff_products)} mục FF"
+        f" ({sum(len(p['stock']) for p in ff_products.values())} acc)"
+    )
     try:
       admin_bot.answer_callback_query(call.id)
       admin_bot.edit_message_text(
@@ -1635,35 +1997,24 @@ def admin_menu_handler(call):
 
   if action.startswith("act_filter_die_"):
     p_id = action.replace("act_filter_die_", "")
+    if p_id not in tele_products:
+      admin_bot.answer_callback_query(call.id, "❌ Mục không tồn tại!")
+      return
     admin_bot.answer_callback_query(call.id, "⏳ Đang quét acc die...")
     product = tele_products[p_id]
-    live_stock = []
-    die_count = 0
-    for acc in product["stock"]:
-      restore_session_files(acc)
-      if os.path.exists(acc["session_path"]):
-        api_id, api_hash = DEFAULT_API_ID, DEFAULT_API_HASH
-        if os.path.exists(acc["json_path"]):
-          try:
-            with open(acc["json_path"], "r") as jf:
-              jdata = json.load(jf)
-              api_id = jdata.get("app_id", DEFAULT_API_ID)
-              api_hash = jdata.get("app_hash", DEFAULT_API_HASH)
-          except Exception:
-            pass
-        is_live, _ = run_async_check(acc["session_path"], api_id, api_hash)
-        if is_live:
-          live_stock.append(acc)
-        else:
-          die_count += 1
-      else:
-        die_count += 1
+    total_before = len(product["stock"])
+    live_stock, die_count = audit_tele_stock(
+        product, limit=MAX_SESSION_CHECKS_PER_PURCHASE
+    )
     product["stock"] = live_stock
     save_data()
-    admin_bot.send_message(
-        cid,
-        f"✅ Đã quét xong! Sống: {len(live_stock)} | Xóa die: {die_count}",
-    )
+    message = f"✅ Đã quét xong! Sống: {len(live_stock)} | Xóa die: {die_count}"
+    if len(live_stock) + die_count < total_before:
+      message += (
+          f"\n⚠️ Chỉ kiểm tra {MAX_SESSION_CHECKS_PER_PURCHASE} acc mỗi lượt;"
+          " bấm lọc lại để quét tiếp."
+      )
+    admin_bot.send_message(cid, message)
     return
 
   if action.startswith("act_filter_qty_"):
@@ -2040,27 +2391,43 @@ def admin_handle_approvals(call):
         )
 
     save_data()
+    u_username = user_data.get(target_uid, {}).get("username", "Không có")
+    formatted_approval_msg = (
+        f"✅ **ĐÃ DUYỆT NẠP THÀNH CÔNG**\n\n"
+        f"👤 **Khách hàng:** `{u_username}`\n"
+        f"🆔 **ID Telegram:** `{target_uid}`\n"
+        f"💵 **Số tiền nạp:** `{amount:,} VNĐ`"
+    )
     try:
       admin_bot.edit_message_caption(
-          f"✅ Đã duyệt nạp {amount:,} VNĐ",
+          formatted_approval_msg,
           call.message.chat.id,
           call.message.message_id,
+          parse_mode="Markdown",
       )
       shop_bot.send_message(
           target_uid,
-          f"🎉 Nạp thành công +{amount:,} VNĐ!",
+          f"🎉 **NẠP TIỀN THÀNH CÔNG!**\n\n💵 Cộng vào tài khoản: **+{amount:,}"
+          " VNĐ**",
           reply_markup=get_main_keyboard(),
+          parse_mode="Markdown",
       )
     except Exception:
+      # The balance and deposit counter are already saved, so a failed message
+      # must not be reported as a failed approval.
       pass
   else:
     try:
       admin_bot.edit_message_caption(
-          "❌ Đã từ chối nạp.", call.message.chat.id, call.message.message_id
+          f"❌ **ĐÃ TỪ CHỐI NẠP TIỀN**\n\n👤 Khách hàng: `{u_username}`\n🆔 ID:"
+          f" `{target_uid}`",
+          call.message.chat.id,
+          call.message.message_id,
+          parse_mode="Markdown",
       )
       shop_bot.send_message(
           target_uid,
-          "❌ Đơn nạp tiền bị từ chối.",
+          "❌ Đơn nạp tiền của bạn đã bị từ chối bởi Quản trị viên.",
           reply_markup=get_main_keyboard(),
       )
     except Exception:
@@ -2086,8 +2453,10 @@ def ensure_runtime():
   global _runtime_initialized, _processing_update
   global SHOP_TOKEN, ADMIN_TOKEN, ADMIN_ID, DEFAULT_API_ID, DEFAULT_API_HASH
   global BANK_NAME, BANK_STK, ACCOUNT_NAME, QR_IMAGE_PATH, DATA_FILE, SESSIONS_DIR
+  global DON_MUA_GROUP_CHAT_ID, DON_ACC_GROUP_URL
   global shop_bot, admin_bot, store, qrcode, types
   global TelegramClient, AuthKeyUnregisteredError, UserDeactivatedBanError
+  global SessionRevokedError
   with _runtime_lock:
     if _runtime_initialized:
       return
@@ -2102,6 +2471,17 @@ def ensure_runtime():
     BANK_NAME = os.environ.get('BANK_NAME', 'Vietcombank')
     BANK_STK = os.environ.get('BANK_STK', '9974775827')
     ACCOUNT_NAME = os.environ.get('ACCOUNT_NAME', 'VO QUOC HUY')
+    # The order-log group id used to be hard-coded. It is a chat id, not a
+    # credential, so it defaults to the existing group but can be overridden.
+    DON_MUA_GROUP_CHAT_ID = os.environ.get(
+        'DON_MUA_GROUP_CHAT_ID', '-1004462598264'
+    ).strip()
+    if DON_MUA_GROUP_CHAT_ID.lstrip('-').isdigit():
+      # Accept the unprefixed form from .env files that strip a leading '-'.
+      DON_MUA_GROUP_CHAT_ID = -int(DON_MUA_GROUP_CHAT_ID.lstrip('-'))
+    DON_ACC_GROUP_URL = os.environ.get(
+        'DON_ACC_GROUP_URL', 'https://t.me/donacctele'
+    ).strip()
     QR_IMAGE_PATH = str(PROJECT_DIR / 'tl' / 'qr.jpg')
     data_dir = Path(os.environ.get('BOT_DATA_DIR') or (
         '/tmp/tl' if os.environ.get('VERCEL') else str(PROJECT_DIR / 'tl')
@@ -2117,13 +2497,18 @@ def ensure_runtime():
     import telebot
     from telebot import types
     from telethon import TelegramClient
-    from telethon.errors import AuthKeyUnregisteredError, UserDeactivatedBanError
+    from telethon.errors import (
+        AuthKeyUnregisteredError,
+        SessionRevokedError,
+        UserDeactivatedBanError,
+    )
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     restore_data(default_data())
     _processing_update = False
     shop_bot = telebot.TeleBot(SHOP_TOKEN, threaded=False)
     admin_bot = telebot.TeleBot(ADMIN_TOKEN, threaded=False)
     shop_bot.message_handler(commands=["link"])(shop_link_info)
+    shop_bot.message_handler(commands=["donacc", "donmua"])(shop_donacc)
     shop_bot.message_handler(commands=["start"])(shop_start)
     shop_bot.callback_query_handler(func=lambda call: call.data == "verify_join")(verify_join_callback)
     shop_bot.callback_query_handler(
@@ -2139,6 +2524,12 @@ def ensure_runtime():
     admin_bot.message_handler(
         commands=["tb"], func=lambda message: message.from_user.id == ADMIN_ID
     )(admin_broadcast)
+    admin_bot.message_handler(
+        commands=["resettop"], func=lambda message: message.from_user.id == ADMIN_ID
+    )(admin_resettop)
+    admin_bot.message_handler(
+        commands=["menu"], func=lambda message: message.from_user.id == ADMIN_ID
+    )(admin_menu_cmd)
     admin_bot.message_handler(commands=["start"])(admin_start)
     admin_bot.callback_query_handler(
         func=lambda call: call.data.startswith(
@@ -2353,6 +2744,12 @@ def configure_webhooks(base, drop_pending_updates=False):
       telegram_request(token, 'setMyCommands', {'commands': [
           {'command': 'start', 'description': 'Mở Cửa Hàng'},
           {'command': 'link', 'description': 'Cách nuôi acc'},
+          {'command': 'donacc', 'description': 'Nhóm Đơn acc'},
+      ]})
+    if name == 'admin':
+      telegram_request(token, 'setMyCommands', {'commands': [
+          {'command': 'start', 'description': 'Mở Bảng Điều Khiển Admin'},
+          {'command': 'menu', 'description': 'Xem danh sách lệnh quản lý'},
       ]})
     show_webhook_status(name, telegram_request(token, 'getWebhookInfo', {}))
 

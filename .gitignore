@@ -13,3 +13,4 @@ sessions_storage/
 .runtime/
 .trashed-*
 *.zip
+.push/

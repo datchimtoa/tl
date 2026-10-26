@@ -6,6 +6,7 @@ command. There are no imports from separate local bot/storage modules, no
 compressed/embedded source, and no polling loop. Vercel loads the standard
 library `handler` class and dispatches updates synchronously to the right bot:
 
+
 | URL | Purpose |
 | --- | --- |
 | `GET /api/health` | Liveness check (does not verify Telegram or Redis connectivity) |
@@ -22,7 +23,9 @@ The current production URLs are:
 `vercel.json` maps both URLs to this one function. `tl/qr.jpg` is an optional
 payment QR asset; if it is absent, the existing QR generation fallback is used.
 The scripts directory contains only optional compatibility/migration utilities,
-not runtime dependencies.
+not runtime dependencies. The original single-file polling bot is kept only as
+`tl.zip` for historical reference; it is excluded from the function bundle and
+is not imported, executed, or served.
 
 ## 1. Replace exposed credentials
 
@@ -52,6 +55,8 @@ Variables** for the production environment:
 | `BOT_STORAGE_KEY` | No | State namespace; defaults to `tl:state` |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | For session checks | Telethon credentials |
 | `BANK_NAME`, `BANK_STK`, `ACCOUNT_NAME` | No | Override the existing bank settings |
+| `DON_MUA_GROUP_CHAT_ID` | No | Order-log group; defaults to the previous group |
+| `DON_ACC_GROUP_URL` | No | Group link shown by `/donacc`; defaults to the previous link |
 
 The alternative `KV_REST_API_URL` / `KV_REST_API_TOKEN` pair is also supported
 when neither `UPSTASH_REDIS_REST_*` variable is set. A partially configured
@@ -242,6 +247,24 @@ Run the offline tests (Telegram and Redis network calls are mocked):
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+## Handler behaviour in this version
+
+The single-file runtime carries over every handler from the original polling
+bot, including the newer shop features. A few of them were resized so they fit
+inside one serverless request; the values below are module constants near the
+top of `api/index.py`.
+
+| Behaviour | Detail |
+| --- | --- |
+| `/donacc`, `/donmua` and the `🛒 Đơn acc` button | Send the group link (`DON_ACC_GROUP_URL`). The button is also available before channel verification, because that group is what verification leads to. |
+| Telegram account purchase | Each stock account is now verified with Telethon before it is sold; dead sessions are deleted from stock. The undelivered part of the order is refunded to the buyer's VND balance. |
+| `MAX_SESSION_CHECKS_PER_PURCHASE` (10) | Maximum account checks per purchase. Unchecked accounts stay in stock rather than being sold unverified. Needs `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. |
+| `SESSION_CHECK_TIMEOUT` (10 s) | Bound on one session check; the client is always disconnected afterwards. |
+| `MAX_BROADCAST_RECIPIENTS` (100) | `/tb` and the `/resettop` announcement only reach this many users per request. Re-run for the next batch. |
+| Order logging | Purchases are also posted to `DON_MUA_GROUP_CHAT_ID` (the shop bot must be a member). Leave it empty to disable logging. |
+| Referral bonus | A verified referral pays a random 100–500 VND bonus to the referrer, limited to the first `REFERRAL_BONUS_LIMIT` (100) referrals per account so it cannot be farmed. |
+| `/resettop`, `/menu` | Admin-only ranking reset and command list. |
 
 ## Serverless limits and delivery guarantees
 

@@ -1,5 +1,6 @@
 import base64
 import ast
+import asyncio
 import http.client
 from http.server import ThreadingHTTPServer
 import io
@@ -10,6 +11,7 @@ import sys
 import subprocess
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
@@ -117,7 +119,7 @@ class BotTests(unittest.TestCase):
     self.bot.ensure_runtime()
     self.assertIs(shop, self.bot.shop_bot)
     after = (len(self.bot.shop_bot.message_handlers), len(self.bot.shop_bot.callback_query_handlers), len(self.bot.admin_bot.message_handlers), len(self.bot.admin_bot.callback_query_handlers))
-    self.assertEqual(before, (3, 4, 3, 2))
+    self.assertEqual(before, (4, 4, 5, 2))
     self.assertEqual(after, before)
 
   def test_shop_start_is_dispatched_and_duplicate_is_not(self):
@@ -257,6 +259,316 @@ class BotTests(unittest.TestCase):
     self.seed(processed_updates={'shop': list(range(2000))})
     self.bot.process_webhook('shop', self.update({'update_id': 2000}))
     self.assertEqual(self.bot.store.load()['processed_updates']['shop'], list(range(1, 2001)))
+
+  def test_admin_commands_reset_the_tables_and_reach_users(self):
+    self.seed(user_balances={'42': 1234, '43': 99}, verified_users=[42])
+    with patch.object(self.bot.admin_bot, 'reply_to') as reply, \
+        patch.object(self.bot.shop_bot, 'send_message') as notice:
+      self.bot.process_webhook('admin', self.update(message_update(201, '/resettop all', uid=99)))
+    reply.assert_called_once()
+    saved = self.bot.store.load()
+    self.assertEqual(saved['user_refs_count'], {})
+    self.assertEqual(saved['user_total_deposits'], {})
+    self.assertEqual(notice.call_count, 2)
+    self.assertEqual(self.bot.user_refs_count, {})
+
+  def test_admin_resettop_rejects_an_unknown_table(self):
+    self.seed(user_refs_count={'42': 3})
+    with patch.object(self.bot.admin_bot, 'reply_to'), patch.object(self.bot.shop_bot, 'send_message'):
+      self.bot.process_webhook('admin', self.update(message_update(202, '/resettop everything', uid=99)))
+    self.assertEqual(self.bot.store.load()['user_refs_count'], {'42': 3})
+
+  def test_admin_resettop_broadcast_is_capped_per_invocation(self):
+    users = {str(uid): 1 for uid in range(1, 151)}
+    self.seed(user_balances=users)
+    with patch.object(self.bot, 'MAX_BROADCAST_RECIPIENTS', 100), \
+        patch.object(self.bot.admin_bot, 'reply_to'), \
+        patch.object(self.bot.shop_bot, 'send_message') as notice:
+      self.bot.process_webhook('admin', self.update(message_update(203, '/resettop ref', uid=99)))
+    self.assertEqual(notice.call_count, 100)
+
+  def test_donacc_command_shares_the_order_group_link(self):
+    with patch.object(self.bot.shop_bot, 'send_message') as send:
+      self.bot.process_webhook('shop', self.update(message_update(204, '/donacc')))
+    self.assertIn(self.bot.DON_ACC_GROUP_URL, send.call_args.args[1])
+
+  def test_donacc_menu_button_does_not_require_verification(self):
+    with patch.object(self.bot.shop_bot, 'send_message') as send, \
+        patch.object(self.bot.shop_bot, 'reply_to') as reply:
+      self.bot.process_webhook('shop', self.update(message_update(205, '🛒 Đơn acc')))
+    reply.assert_not_called()
+    self.assertIn(self.bot.DON_ACC_GROUP_URL, send.call_args.args[1])
+
+  def test_order_group_id_is_configurable_and_normalized(self):
+    for value in ('-100123', '100123'):
+      with self.subTest(value=value), patch.dict(os.environ, {'DON_MUA_GROUP_CHAT_ID': value}):
+        self.bot._runtime_initialized = False
+        self.bot.ensure_runtime()
+        self.assertEqual(self.bot.DON_MUA_GROUP_CHAT_ID, -100123)
+
+  def test_giftcode_menu_step_is_consumed_so_a_typo_does_not_block_the_chat(self):
+    self.seed(verified_users=[42])
+    with patch.object(self.bot.shop_bot, 'send_message') as send:
+      self.bot.process_webhook('shop', self.update(message_update(210, '🎁 Nhập Code')))
+      self.bot.process_webhook('shop', self.update(message_update(211, 'khong-ton-tai')))
+    invalid = send.call_args_list[-1].args[1]
+    self.assertIn('không hợp lệ', invalid)
+    self.assertEqual(self.bot.pending_withdraws, {})
+
+
+class PurchaseTests(unittest.TestCase):
+  """Live-account verification, refunds and order logging on purchase."""
+
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+    self.addCleanup(self.temp.cleanup)
+    self.env = patch.dict(os.environ, {**TEST_ENV, 'BOT_DATA_DIR': self.temp.name})
+    self.env.start()
+    self.addCleanup(self.env.stop)
+    self.bot = application
+    self.bot._runtime_initialized = False
+    with patch('telebot.apihelper._make_request', side_effect=AssertionError('Import called Telegram')):
+      self.bot.ensure_runtime()
+    self.api = patch('telebot.apihelper._make_request', side_effect=AssertionError('Unexpected live Telegram call'))
+    self.api.start()
+    self.addCleanup(self.api.stop)
+    self.bot.store = MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR)
+
+  def stock_accounts(self, count):
+    accounts = []
+    # Real stock lives under SESSIONS_DIR so it can be mirrored to storage.
+    root = Path(self.temp.name) / 'sessions_storage'
+    root.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+      session = root / f'acc{index}.session'
+      credentials = root / f'acc{index}.json'
+      session.write_bytes(f'session-{index}'.encode())
+      credentials.write_text(json.dumps({'app_id': 1, 'app_hash': 'hash'}))
+      self.bot.store.save_file(session)
+      self.bot.store.save_file(credentials)
+      accounts.append({'session_path': str(session), 'json_path': str(credentials)})
+    return accounts
+
+  def confirm_purchase(self, qty, price=10000):
+    with self.bot.store.transaction():
+      self.bot.restore_data(self.bot.default_data())
+      self.bot.user_balances[42] = price * qty
+      self.bot.verified_users.add(42)
+      self.bot.tele_products['p1'] = {
+          'name': 'Tele pack', 'price': price, 'stock': self.stock_accounts(qty),
+      }
+      self.bot.pending_buy[42] = {
+          'cat': 'tele', 'p_id': 'p1', 'qty': qty,
+          'total_price': price * qty, 'step': 'CONFIRM_BUY',
+      }
+      self.bot.store.save(self.bot.snapshot_data())
+    return {'update_id': 300, 'callback_query': {
+        'id': 'confirm-300', 'chat_instance': 'test-chat',
+        'from': {'id': 42, 'is_bot': False, 'first_name': 'Buyer'},
+        'message': message_update(299, 'Confirm')['message'],
+        'data': 'confirm_buy_yes',
+    }}
+
+  def shop_patches(self):
+    patches = {
+        'answer_callback_query': patch.object(self.bot.shop_bot, 'answer_callback_query'),
+        'delete_message': patch.object(self.bot.shop_bot, 'delete_message'),
+        'edit_message_text': patch.object(self.bot.shop_bot, 'edit_message_text'),
+        'send_document': patch.object(self.bot.shop_bot, 'send_document'),
+        'send_message': patch.object(self.bot.shop_bot, 'send_message'),
+    }
+    started = {}
+    for name, patcher in patches.items():
+      started[name] = patcher.start()
+      self.addCleanup(patcher.stop)
+    return started
+
+  def test_dead_accounts_are_removed_and_the_missing_part_is_refunded(self):
+    payload = self.confirm_purchase(qty=3)
+    calls = self.shop_patches()
+    answers = iter([(True, 'ok'), (False, 'die'), (True, 'ok')])
+    with patch.object(self.bot, 'run_async_check', side_effect=lambda *a, **k: next(answers)):
+      self.bot.process_webhook('shop', self.bot_update(payload))
+    self.assertTrue(calls['send_document'].called)
+    saved = self.bot.store.load()
+    self.assertEqual(saved['user_balances']['42'], 10000)
+    # Only one account was still alive to sell, so no stock is left over.
+    self.assertEqual(self.bot.tele_products, {})
+
+  def test_purchase_is_fully_refunded_when_no_account_is_alive(self):
+    payload = self.confirm_purchase(qty=2)
+    calls = self.shop_patches()
+    with patch.object(self.bot, 'run_async_check', return_value=(False, 'die')):
+      self.bot.process_webhook('shop', self.bot_update(payload))
+    calls['send_document'].assert_not_called()
+    saved = self.bot.store.load()
+    self.assertEqual(saved['user_balances']['42'], 20000)
+    # Everything died, so the product is emptied and then pruned from the shop.
+    self.assertEqual(self.bot.tele_products, {})
+    self.assertNotIn('p1', saved['tele_products'])
+    self.assertTrue(any('hoàn lại' in call.args[1] for call in calls['send_message'].call_args_list))
+
+  def test_session_checks_per_purchase_are_bounded(self):
+    payload = self.confirm_purchase(qty=5)
+    calls = self.shop_patches()
+    with patch.object(self.bot, 'MAX_SESSION_CHECKS_PER_PURCHASE', 2), \
+        patch.object(self.bot, 'run_async_check', return_value=(False, 'die')) as check:
+      self.bot.process_webhook('shop', self.bot_update(payload))
+    self.assertEqual(check.call_count, 2)
+    # Untouched accounts stay in stock for a later attempt.
+    self.assertEqual(len(self.bot.store.load()['tele_products']['p1']['stock']), 3)
+
+  def test_order_is_logged_to_the_configured_group(self):
+    payload = self.confirm_purchase(qty=1)
+    calls = self.shop_patches()
+    with patch.object(self.bot, 'run_async_check', return_value=(True, 'ok')), \
+        patch.object(self.bot, 'DON_MUA_GROUP_CHAT_ID', -100999):
+      self.bot.process_webhook('shop', self.bot_update(payload))
+    chats = [call.args[0] for call in calls['send_message'].call_args_list]
+    self.assertIn(-100999, chats)
+
+  def bot_update(self, payload):
+    from telebot.types import Update
+    return Update.de_json(payload)
+
+
+class SessionCheckTests(unittest.TestCase):
+  """Telethon session checks use fakes; no network access happens here."""
+
+  class FakeClient:
+    def __init__(self, authorized=True, user=None, dialogs_error=None):
+      self.authorized = authorized
+      self.user = user if user is not None else SimpleNamespace(
+          deactivated=False, restricted=False
+      )
+      self.dialogs_error = dialogs_error
+      self.connected = False
+      self.disconnected = False
+
+    async def connect(self):
+      self.connected = True
+
+    async def is_user_authorized(self):
+      return self.authorized
+
+    async def get_me(self):
+      return self.user
+
+    def is_connected(self):
+      return self.connected
+
+    async def disconnect(self):
+      self.disconnected = True
+
+    async def iter_dialogs(self, limit=None):
+      if self.dialogs_error:
+        raise self.dialogs_error
+      return
+      yield  # pragma: no cover - makes this an async generator
+
+  def check(self, client, session_path='session.session'):
+    return asyncio.run(application.check_single_session(
+        session_path, 1, 'hash',
+        client_factory=lambda *args, **kwargs: client,
+    ))
+
+  def test_live_session_is_accepted_and_disconnected(self):
+    client = self.FakeClient()
+    with tempfile.NamedTemporaryFile(suffix='.session') as session:
+      live, result = self.check(client, session.name)
+    self.assertTrue(live)
+    self.assertEqual(result, client.user)
+    self.assertTrue(client.disconnected)
+
+  def test_missing_session_file_is_reported_without_a_client(self):
+    live, reason = self.check(self.FakeClient(), '/nonexistent/missing.session')
+    self.assertFalse(live)
+    self.assertIn('không tồn tại', reason)
+
+  def test_unauthorized_session_is_dead(self):
+    live, reason = self.check(self.FakeClient(authorized=False), __file__)
+    self.assertFalse(live)
+    self.assertEqual(reason, 'Unauthorized/Session Die')
+
+  def test_flagged_user_is_dead(self):
+    for flag in ('deactivated', 'restricted'):
+      with self.subTest(flag=flag):
+        flags = {'deactivated': False, 'restricted': False}
+        flags[flag] = True
+        client = self.FakeClient(user=SimpleNamespace(**flags))
+        live, reason = self.check(client, __file__)
+        self.assertFalse(live)
+        self.assertEqual(reason, 'Deactivated/Frozen')
+        self.assertTrue(client.disconnected)
+
+  def test_frozen_dialog_error_is_dead(self):
+    client = self.FakeClient(dialogs_error=RuntimeError('USER_DEACTIVATED'))
+    live, reason = self.check(client, __file__)
+    self.assertFalse(live)
+    self.assertIn('Frozen/Invalid', reason)
+
+  def test_unrelated_dialog_error_still_counts_as_live(self):
+    client = self.FakeClient(dialogs_error=RuntimeError('temporary timeout'))
+    live, _ = self.check(client, __file__)
+    self.assertTrue(live)
+
+
+class ReferralTests(unittest.TestCase):
+  """The referral bonus pays VND but stays bounded."""
+
+  def setUp(self):
+    self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+    self.addCleanup(self.temp.cleanup)
+    self.env = patch.dict(os.environ, {**TEST_ENV, 'BOT_DATA_DIR': self.temp.name})
+    self.env.start()
+    self.addCleanup(self.env.stop)
+    self.bot = application
+    self.bot._runtime_initialized = False
+    with patch('telebot.apihelper._make_request', side_effect=AssertionError('Import called Telegram')):
+      self.bot.ensure_runtime()
+    self.api = patch('telebot.apihelper._make_request', side_effect=AssertionError('Unexpected live Telegram call'))
+    self.api.start()
+    self.addCleanup(self.api.stop)
+    self.bot.store = MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR)
+
+  def verify(self, referrer_refs):
+    with self.bot.store.transaction():
+      data = self.bot.default_data()
+      data['user_refs_count'] = {'99': referrer_refs}
+      data['user_balances']['99'] = 1000
+      self.bot.store.save(data)
+    with patch.object(self.bot.shop_bot, 'get_chat_member') as member, \
+        patch.object(self.bot.shop_bot, 'send_message'), \
+        patch.object(self.bot.admin_bot, 'send_message'), \
+        patch.object(self.bot.shop_bot, 'answer_callback_query'), \
+        patch.object(self.bot.shop_bot, 'edit_message_text'), \
+        patch.object(self.bot.random, 'randint', return_value=250):
+      member.return_value.status = 'member'
+      self.bot.process_webhook('shop', self.bot_update(message_update(400, '/start ref_99', uid=42)))
+      self.bot.process_webhook('shop', self.bot_update({
+          'update_id': 401,
+          'callback_query': {
+              'id': 'callback-401', 'chat_instance': 'test-chat',
+              'from': {'id': 42, 'is_bot': False, 'first_name': 'Ref'},
+              'message': message_update(400, '/start')['message'],
+              'data': 'verify_join',
+          },
+      }))
+    return self.bot.store.load()
+
+  def test_bonus_is_paid_in_vnd_for_a_new_referral(self):
+    saved = self.verify(referrer_refs=0)
+    self.assertEqual(saved['user_refs_count']['99'], 1)
+    self.assertEqual(saved['user_balances']['99'], 1250)
+
+  def test_bonus_stops_after_the_limit(self):
+    saved = self.verify(referrer_refs=self.bot.REFERRAL_BONUS_LIMIT)
+    self.assertEqual(saved['user_refs_count']['99'], self.bot.REFERRAL_BONUS_LIMIT + 1)
+    self.assertEqual(saved['user_balances']['99'], 1000)
+
+  def bot_update(self, payload):
+    from telebot.types import Update
+    return Update.de_json(payload)
 
 
 class StorageTests(unittest.TestCase):
