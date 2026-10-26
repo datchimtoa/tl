@@ -56,7 +56,7 @@ Variables** for the production environment:
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | For session checks | Telethon credentials |
 | `BANK_NAME`, `BANK_STK`, `ACCOUNT_NAME` | No | Override the existing bank settings |
 | `DON_MUA_GROUP_CHAT_ID` | No | Order-log group; defaults to the previous group |
-| `DON_ACC_GROUP_URL` | No | Group link shown by `/donacc`; defaults to the previous link |
+| `DON_MUA_GROUP_CHAT_ID` | No | "Đơn acc" order-log group; defaults to the value in `tl.py` |
 
 The alternative `KV_REST_API_URL` / `KV_REST_API_TOKEN` pair is also supported
 when neither `UPSTASH_REDIS_REST_*` variable is set. A partially configured
@@ -250,20 +250,17 @@ python -m unittest discover -s tests -v
 
 ## Handler behaviour in this version
 
-The single-file runtime carries over every handler from the original polling
-bot, including the newer shop features. A few of them were resized so they fit
-inside one serverless request; the values below are module constants near the
-top of `api/index.py`.
+The runtime is the original single-file bot (`tl.py`) with **only the transport
+changed**: polling became an HTTP webhook. All handlers, wording and business
+logic are identical to `tl.py`; `api/index.py` adds only the webhook layer
+(`handler`, `process_webhook`, `StateStore`, `ensure_runtime`).
 
 | Behaviour | Detail |
 | --- | --- |
-| `/donacc`, `/donmua` and the `🛒 Đơn acc` button | Send the group link (`DON_ACC_GROUP_URL`). The button is also available before channel verification, because that group is what verification leads to. |
-| Telegram account purchase | Each stock account is now verified with Telethon before it is sold; dead sessions are deleted from stock. The undelivered part of the order is refunded to the buyer's VND balance. |
-| `MAX_SESSION_CHECKS_PER_PURCHASE` (10) | Maximum account checks per purchase. Unchecked accounts stay in stock rather than being sold unverified. Needs `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. |
-| `SESSION_CHECK_TIMEOUT` (10 s) | Bound on one session check; the client is always disconnected afterwards. |
-| `MAX_BROADCAST_RECIPIENTS` (100) | `/tb` and the `/resettop` announcement only reach this many users per request. Re-run for the next batch. |
-| Order logging | Purchases are also posted to `DON_MUA_GROUP_CHAT_ID` (the shop bot must be a member). Leave it empty to disable logging. |
-| Referral bonus | A verified referral pays a random 100–500 VND bonus to the referrer, limited to the first `REFERRAL_BONUS_LIMIT` (100) referrals per account so it cannot be farmed. |
+| `/donacc`, `/donmua` | Send the "Đơn acc" group link. |
+| Telegram account purchase | Each stock account is checked with Telethon while buying; dead sessions are dropped and the missing part is refunded. Needs `TELEGRAM_API_ID`/`TELEGRAM_API_HASH`. |
+| Order logging | Purchases are also posted to the "Đơn acc" group; the shop bot must be a member. |
+| Referral bonus | A verified referral pays a random 100–500 VND bonus to the referrer. |
 | `/resettop`, `/menu` | Admin-only ranking reset and command list. |
 
 ## Serverless limits and delivery guarantees
