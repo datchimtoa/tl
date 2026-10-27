@@ -80,7 +80,7 @@ end
 return 0
 """
 
-  def __init__(self, data_file, sessions_dir):
+  def __init__(self, data_file, sessions_dir, lock_suffix=':lock'):
     self.data_file = Path(data_file)
     self.sessions_dir = Path(sessions_dir)
     primary_url = os.environ.get('UPSTASH_REDIS_REST_URL', '').strip()
@@ -93,6 +93,11 @@ return 0
       self.url = os.environ.get('KV_REST_API_URL', '').strip().rstrip('/')
       self.token = os.environ.get('KV_REST_API_TOKEN', '').strip()
     self.key = os.environ.get('BOT_STORAGE_KEY', 'tl:state')
+    # Each bot takes its own lock. Both bots share one state document, but a
+    # slow shop job (a zip upload checking every account) must not block admin
+    # updates: that made Telegram retries pile up until the admin bot went
+    # silent. The lock key is per bot, the state key is still shared.
+    self.lock_key = self.key + lock_suffix
     self._mutex = threading.Lock()
     self._lock_token = None
     self._committed = False
@@ -157,7 +162,7 @@ return 0
       if self._lock_token is None:
         raise StorageError('Redis state must be saved inside a transaction.')
       result = self.command(
-          'EVAL', self.COMMIT, 2, self.key + ':lock', self.key,
+          'EVAL', self.COMMIT, 2, self.lock_key, self.key,
           self._lock_token, encoded,
       )
       if result != 1:
@@ -180,7 +185,7 @@ return 0
     try:
       if self.url:
         token = uuid.uuid4().hex
-        if self.command('SET', self.key + ':lock', token, 'NX', 'EX', self.LOCK_SECONDS) != 'OK':
+        if self.command('SET', self.lock_key, token, 'NX', 'EX', self.LOCK_SECONDS) != 'OK':
           raise StorageBusy('Another instance is processing an update.')
         self._lock_token = token
         acquired = True
@@ -192,7 +197,7 @@ return 0
       try:
         if acquired:
           try:
-            self.command('EVAL', self.RELEASE, 1, self.key + ':lock', self._lock_token)
+            self.command('EVAL', self.RELEASE, 1, self.lock_key, self._lock_token)
           except StorageError as exc:
             # Cleanup must not replace a handler error or fail a durable commit.
             # The lock still expires automatically; subsequent updates retry.
@@ -329,10 +334,12 @@ def restore_data(data):
 
 
 def process_webhook(bot_name, update):
-  global _processing_update
+  global _processing_update, store
   ensure_runtime()
   bot = {"shop": shop_bot, "admin": admin_bot}[bot_name]
   stage = "lock_acquire"
+  # Use this bot's own lock so a slow shop job cannot block admin updates.
+  store = stores[bot_name]
   try:
     with store.transaction():
       stage = "state_load"
@@ -2164,7 +2171,7 @@ def ensure_runtime():
   global SHOP_TOKEN, ADMIN_TOKEN, ADMIN_ID, DEFAULT_API_ID, DEFAULT_API_HASH
   global BANK_NAME, BANK_STK, ACCOUNT_NAME, QR_IMAGE_PATH, DATA_FILE, SESSIONS_DIR
   global DON_MUA_GROUP_CHAT_ID
-  global shop_bot, admin_bot, store, qrcode, types
+  global shop_bot, admin_bot, store, stores, qrcode, types
   global TelegramClient, AuthKeyUnregisteredError, UserDeactivatedBanError
   with _runtime_lock:
     if _runtime_initialized:
@@ -2188,7 +2195,12 @@ def ensure_runtime():
     DATA_FILE = str(data_dir / 'bot_data.json')
     SESSIONS_DIR = str(data_dir / 'sessions_storage')
     try:
-      store = StateStore(DATA_FILE, SESSIONS_DIR)
+      # One store per bot so each takes its own lock; the state key is shared.
+      stores = {
+          'shop': StateStore(DATA_FILE, SESSIONS_DIR, lock_suffix=':lock'),
+          'admin': StateStore(DATA_FILE, SESSIONS_DIR, lock_suffix=':lock:admin'),
+      }
+      store = stores['shop']
     except StorageError as exc:
       exc.stage = 'runtime_init'
       raise

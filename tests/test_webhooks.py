@@ -50,8 +50,8 @@ def message_update(update_id, text, uid=42):
 
 class MemoryRedisStore(StateStore):
   """Test double for Redis commands, including ownership-checked commits."""
-  def __init__(self, data_file, sessions_dir, database=None):
-    super().__init__(data_file, sessions_dir)
+  def __init__(self, data_file, sessions_dir, database=None, lock_suffix=':lock'):
+    super().__init__(data_file, sessions_dir, lock_suffix=lock_suffix)
     self.url = 'https://redis.example.test'
     self.database = database if database is not None else {}
 
@@ -95,7 +95,13 @@ class BotTests(unittest.TestCase):
     self.api = patch('telebot.apihelper._make_request', side_effect=AssertionError('Unexpected live Telegram call'))
     self.api.start()
     self.addCleanup(self.api.stop)
-    self.bot.store = MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR)
+    # Mirror ensure_runtime: one store per bot, sharing one state document.
+    database = {}
+    self.bot.stores = {
+        'shop': MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database, ':lock'),
+        'admin': MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database, ':lock:admin'),
+    }
+    self.bot.store = self.bot.stores['shop']
 
   def update(self, payload):
     from telebot.types import Update
@@ -138,6 +144,23 @@ class BotTests(unittest.TestCase):
     admin_send.assert_called_once()
     shop_send.assert_called_once()
 
+  def test_each_bot_uses_its_own_lock_on_one_shared_state_key(self):
+    shop, admin = self.bot.stores['shop'], self.bot.stores['admin']
+    self.assertEqual(shop.key, admin.key)
+    self.assertNotEqual(shop.lock_key, admin.lock_key)
+
+  def test_admin_is_not_blocked_while_the_shop_holds_its_lock(self):
+    shop, admin = self.bot.stores['shop'], self.bot.stores['admin']
+    with shop.transaction():
+      # A slow shop job (account upload) holds only its own lock.
+      with self.assertRaises(StorageBusy):
+        with shop.transaction():
+          pass
+      with admin.transaction():
+        admin.save({'admin': 'commit ok'})
+    self.assertNotIn(shop.lock_key, shop.database)
+    self.assertNotIn(admin.lock_key, admin.database)
+
   def test_deposit_conversation_survives_a_cold_start(self):
     self.seed(verified_users=[42])
     with patch.object(self.bot.shop_bot, 'send_message'):
@@ -147,7 +170,11 @@ class BotTests(unittest.TestCase):
     database = self.bot.store.database
     self.bot._runtime_initialized = False
     self.bot.ensure_runtime()
-    self.bot.store = MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database)
+    self.bot.stores = {
+        'shop': MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database, ':lock'),
+        'admin': MemoryRedisStore(self.bot.DATA_FILE, self.bot.SESSIONS_DIR, database, ':lock:admin'),
+    }
+    self.bot.store = self.bot.stores['shop']
     self.assertEqual(self.bot.pending_deposits, {})
     with patch.object(self.bot.shop_bot, 'send_photo') as photo:
       self.bot.process_webhook('shop', self.update(message_update(2, '10000')))
@@ -163,7 +190,7 @@ class BotTests(unittest.TestCase):
         self.bot.process_webhook('shop', update)
     self.assertEqual(self.bot.store.load(), original)
     self.assertFalse(self.bot._processing_update)
-    self.assertNotIn(self.bot.store.key + ':lock', self.bot.store.database)
+    self.assertNotIn(self.bot.store.lock_key, self.bot.store.database)
 
   def test_committed_update_is_acknowledged_when_lock_cleanup_fails(self):
     store = self.bot.store
@@ -338,10 +365,10 @@ class StorageTests(unittest.TestCase):
   def test_expired_lock_cannot_commit_or_delete_new_owner(self):
     store = MemoryRedisStore(self.file, self.sessions)
     with store.transaction():
-      store.database[store.key + ':lock'] = 'new-owner'
+      store.database[store.lock_key] = 'new-owner'
       with self.assertRaises(StorageError):
         store.save({'bad': 'write'})
-    self.assertEqual(store.database[store.key + ':lock'], 'new-owner')
+    self.assertEqual(store.database[store.lock_key], 'new-owner')
     self.assertIsNone(store.load())
 
   def test_cleanup_error_does_not_mask_the_original_transaction_error(self):
