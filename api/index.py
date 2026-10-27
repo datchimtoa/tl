@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 MAX_BODY_BYTES = 1024 * 1024
 APP_VERSION = 'single-file-webhook-v1'
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# One account check must not outlive the 60-second function budget.
+SESSION_CONNECT_TIMEOUT = 10
 _runtime_lock = threading.Lock()
 _runtime_initialized = False
 _processing_update = False
@@ -370,9 +372,16 @@ async def check_single_session(session_path, api_id=None, api_hash=None):
   if not session_path or not os.path.exists(session_path):
     return False, "File session không tồn tại"
 
+  # tl.py hard-coded the app credentials. The webhook reads them from the
+  # environment, and with api_id=0 Telegram does not fail: the connection
+  # simply hangs, which froze admin uploads forever. Fail fast instead.
+  if not api_id or not api_hash:
+    return False, "Thiếu TELEGRAM_API_ID / TELEGRAM_API_HASH"
+
   client = TelegramClient(session_path, api_id, api_hash, system_version="4.16.30-vx")
   try:
-    await client.connect()
+    # Bound the connect so one dead account cannot block the whole upload.
+    await asyncio.wait_for(client.connect(), timeout=SESSION_CONNECT_TIMEOUT)
     
     if not await client.is_user_authorized():
       return False, "Unauthorized/Session Die"
@@ -421,6 +430,17 @@ def run_async_check(session_path, api_id, api_hash):
         check_single_session(session_path, api_id, api_hash)
     )
   finally:
+    # A timed-out connect can leave a task pending; cancel it before closing
+    # the loop or the next check in the upload loop may reuse a broken loop.
+    try:
+      pending = asyncio.all_tasks(loop)
+      for task in pending:
+        task.cancel()
+      if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    except Exception:
+      pass
+    asyncio.set_event_loop(None)
     loop.close()
   return res
 
